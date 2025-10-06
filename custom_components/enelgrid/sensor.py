@@ -71,9 +71,31 @@ class EnelGridConsumptionSensor(SensorEntity):
     @property
     def state(self):
         return self._state
+    async def update_monthly_sensor(self, all_data_by_date, entry_id):
+        """Aggiorna il sensore mensile con l'ultimo valore cumulativo disponibile."""
+        monthly_sensor = self.hass.data.get("enelgrid_monthly_sensor", {}).get(entry_id)
 
+        if not monthly_sensor:
+            _LOGGER.error(f"Monthly sensor is not available for entry {entry_id}!")
+            return
+
+        if not all_data_by_date:
+            _LOGGER.warning("No data available to update monthly sensor.")
+            return
+
+        # Usa solo l'ultimo valore cumulativo dell’ultimo giorno
+        last_day = max(all_data_by_date.keys())
+        last_point = all_data_by_date[last_day][-1]
+        total_kwh = last_point["cumulative_kwh"]
+
+        monthly_sensor.set_total(total_kwh)
+        _LOGGER.info(f"Updated monthly sensor to {total_kwh} kWh (last day: {last_day})")
     async def async_update(self):
         try:
+            if getattr(self, "_is_updating", False):
+                _LOGGER.warning("Update already in progress, skipping.")
+                return
+            self._is_updating = True    
             self.session = EnelGridSession(
                 self._username, self._password, self._pod, self._numero_utente
             )
@@ -140,11 +162,16 @@ class EnelGridConsumptionSensor(SensorEntity):
             "statistic_id": statistic_id_cost,
             "unit_of_measurement": "EUR",
         }
-
+        saved_dates = set()
         for day_date, data_points in all_data_by_date.items():
             stats_kw = []
             stats_cost = []
-
+            if day_date in saved_dates:
+                _LOGGER.warning(f"Skipping duplicate save for {day_date}")
+                continue
+            saved_dates.add(day_date)
+            
+            _LOGGER.info(f"Saving data for {day_date}: {len(data_points)} hourly points")
             cumulative_offset = await self.get_last_cumulative_kwh(statistic_id_kw)
 
             for point in data_points:
@@ -188,19 +215,6 @@ class EnelGridConsumptionSensor(SensorEntity):
             return last_stats[statistic_id][0]["sum"]  # Last recorded cumulative sum
         return 0.0
 
-    async def update_monthly_sensor(self, all_data_by_date, entry_id):
-        monthly_sensor = self.hass.data.get("enelgrid_monthly_sensor", {}).get(entry_id)
-
-        if not monthly_sensor:
-            _LOGGER.error(f"Monthly sensor is not available for entry {entry_id}!")
-            return
-
-        total_kwh = sum(
-            points[-1]["cumulative_kwh"] for points in all_data_by_date.values()
-        )
-
-        monthly_sensor.set_total(total_kwh)
-        _LOGGER.info(f"Updated monthly sensor to {total_kwh} kWh")
 
 
 class EnelGridMonthlySensor(SensorEntity):
@@ -226,7 +240,7 @@ class EnelGridMonthlySensor(SensorEntity):
 
 
 def parse_enel_hourly_data(data):
-    """Extract all hourly data into per-day structure, preserving cross-day cumulative values."""
+    """Estrai dati orari per ogni giorno, normalizzati in kWh e completi per 24 ore."""
     aggregations = (
         data.get("data", {}).get("aggregationResult", {}).get("aggregations", [])
     )
@@ -238,6 +252,12 @@ def parse_enel_hourly_data(data):
 
     if not hourly_aggregation:
         raise ValueError("No hourly consumption data found in JSON")
+
+    validity_from = data.get("data", {}).get("aggregationResult", {}).get("validityFrom")
+    validity_to = data.get("data", {}).get("aggregationResult", {}).get("validityTo")
+    pod = data.get("data", {}).get("aggregationResult", {}).get("pod")
+
+    _LOGGER.info(f"EnelGrid fetch for POD {pod}: period {validity_from} → {validity_to}")
 
     all_data_by_date = {}
     cumulative_offset = 0
@@ -251,27 +271,37 @@ def parse_enel_hourly_data(data):
         date_str = day_result.get("date")
         day_date = datetime.strptime(date_str, "%d%m%Y").date()
 
+        _LOGGER.debug(f"Parsing data for {date_str} ({day_date})")
+
+        bin_map = {int(b["name"][1:]): b["value"] for b in day_result.get("binValues", [])}
+        missing_hours = [h for h in range(1, 25) if h not in bin_map]
+
+        if missing_hours:
+            _LOGGER.warning(f"Missing hours for {day_date}: {missing_hours}")
+
         hourly_points = []
         running_total = cumulative_offset
 
-        for hour_entry in day_result.get("binValues", []):
-            hour_number = int(hour_entry["name"][1:])
-            hour_time = datetime.combine(day_date, datetime.min.time()) + timedelta(
-                hours=hour_number - 1
+        for hour in range(1, 25):  # H1 to H24
+            raw_value = bin_map.get(hour, 0.0)
+
+            # Conversione difensiva da Wh a kWh
+            normalized_kwh = raw_value / 1000 if raw_value > 10 else raw_value
+
+            hour_time = datetime.combine(day_date, datetime.min.time()) + timedelta(hours=hour - 1)
+            running_total += normalized_kwh
+
+            _LOGGER.debug(
+                f"{day_date} H{hour:02d}: raw={raw_value} → kWh={normalized_kwh:.3f}"
             )
 
-            running_total += hour_entry["value"]
-            hourly_points.append(
-                {
-                    "timestamp": hour_time,
-                    "kwh": hour_entry["value"],
-                    "cumulative_kwh": running_total,
-                }
-            )
+            hourly_points.append({
+                "timestamp": hour_time,
+                "kwh": round(normalized_kwh, 3),
+                "cumulative_kwh": round(running_total, 3),
+            })
 
         all_data_by_date[day_date] = hourly_points
-
-        if hourly_points:
-            cumulative_offset = hourly_points[-1]["cumulative_kwh"]
+        cumulative_offset = hourly_points[-1]["cumulative_kwh"]
 
     return all_data_by_date
